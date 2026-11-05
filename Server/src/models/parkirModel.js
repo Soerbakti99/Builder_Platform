@@ -1,89 +1,100 @@
-const { dbRun, dbGet, dbAll } = require('../middlewares_helpers/sqlite3_helpers');
+const { dbRun, dbGet, dbAll, withTransaction } = require('../middlewares_helpers/sqlite3_helpers');
+const AppError = require('../middlewares_helpers/appError');
 
-/* =========================================================
- *  TRANSAKSI PARKIR
- * ========================================================= */
+const detailQuery = `
+  SELECT t.*, a.nama_area
+  FROM transaksi_parkir AS t
+  LEFT JOIN area_parkir AS a ON t.area_id = a.id
+`;
 
-// 1. Ambil semua riwayat transaksi parkir (gabung nama area)
-const findAllTransaksi = async () => {
-  return await dbAll(`
-    SELECT t.*, a.nama_area 
-    FROM transaksi_parkir t
-    LEFT JOIN area_parkir a ON t.area_id = a.id
-    ORDER BY t.id DESC
-  `);
-};
+const findAllTransaksi = () =>
+  dbAll(`${detailQuery} ORDER BY t.id DESC`);
 
-// 2. Ambil transaksi parkir berdasarkan ID
-const findTransaksiById = async (id) => {
-  return await dbGet(`
-    SELECT t.*, a.nama_area 
-    FROM transaksi_parkir t
-    LEFT JOIN area_parkir a ON t.area_id = a.id
-    WHERE t.id = ?
-  `, [id]);
-};
+const findTransaksiById = (id) =>
+  dbGet(`${detailQuery} WHERE t.id = ?`, [id]);
 
-// 3. Kendaraan Masuk (Check-in)
-const createKendaraanMasuk = async (body) => {
-  const query = `
-    INSERT INTO transaksi_parkir (plat_nomor, jenis_kendaraan, area_id, status)
-    VALUES (?, ?, ?, 'aktif')
-  `;
-  const values = [
-    body.plat_nomor,
-    body.jenis_kendaraan,
-    body.area_id ?? 1
-  ];
+const findAllArea = () =>
+  dbAll('SELECT * FROM area_parkir ORDER BY id ASC');
 
-  const { lastID } = await dbRun(query, values);
+const createKendaraanMasuk = (body) =>
+  withTransaction(async () => {
+    const plateKey = body.plat_nomor.replace(/[\s-]/g, '');
+    const duplicate = await dbGet(`
+      SELECT id FROM transaksi_parkir
+      WHERE status = 'aktif'
+        AND REPLACE(REPLACE(UPPER(plat_nomor), ' ', ''), '-', '') = ?
+      LIMIT 1
+    `, [plateKey]);
 
-  // Update jumlah kendaraan terisi di area parkir
-  await dbRun('UPDATE area_parkir SET terisi = terisi + 1 WHERE id = ?', [body.area_id ?? 1]);
+    if (duplicate) {
+      throw new AppError(409, `Kendaraan dengan plat ${body.plat_nomor} masih tercatat parkir.`);
+    }
 
-  return await findTransaksiById(lastID);
-};
+    
+    const updatedArea = await dbRun(`
+      UPDATE area_parkir
+      SET terisi = terisi + 1
+      WHERE id = ? AND terisi < kapasitas
+    `, [body.area_id]);
 
-// 4. Kendaraan Keluar (Check-out & Hitung Biaya)
-const processKendaraanKeluar = async (id, biayaInput) => {
-  const existing = await findTransaksiById(id);
-  if (!existing || existing.status === 'selesai') return null;
+    if (updatedArea.changes === 0) {
+      const area = await dbGet('SELECT id FROM area_parkir WHERE id = ?', [body.area_id]);
+      if (!area) throw new AppError(404, 'Area parkir tidak ditemukan.');
+      throw new AppError(409, 'Area parkir sudah penuh. Pilih area lain.');
+    }
 
-  const query = `
-    UPDATE transaksi_parkir
-    SET waktu_keluar = CURRENT_TIMESTAMP,
-        biaya = ?,
-        status = 'selesai'
-    WHERE id = ?
-  `;
+    const { lastID } = await dbRun(`
+      INSERT INTO transaksi_parkir (plat_nomor, jenis_kendaraan, area_id, status)
+      VALUES (?, ?, ?, 'aktif')
+    `, [body.plat_nomor, body.jenis_kendaraan, body.area_id]);
 
-  await dbRun(query, [biayaInput, id]);
+    return findTransaksiById(lastID);
+  });
 
-  // Kurangi jumlah kendaraan terisi di area parkir
-  if (existing.area_id) {
-    await dbRun(
-      'UPDATE area_parkir SET terisi = CASE WHEN terisi > 0 THEN terisi - 1 ELSE 0 END WHERE id = ?',
-      [existing.area_id]
+const processKendaraanKeluar = (id, biaya) =>
+  withTransaction(async () => {
+    const existing = await findTransaksiById(id);
+    if (!existing) throw new AppError(404, 'Transaksi parkir tidak ditemukan.');
+    if (existing.status !== 'aktif') {
+      throw new AppError(409, 'Kendaraan sudah keluar. Transaksi telah selesai.');
+    }
+
+    const { changes } = await dbRun(`
+      UPDATE transaksi_parkir
+      SET waktu_keluar = CURRENT_TIMESTAMP,
+          biaya = ?,
+          status = 'selesai'
+      WHERE id = ? AND status = 'aktif'
+    `, [biaya, id]);
+
+    if (!changes) throw new AppError(409, 'Transaksi sudah tidak aktif.');
+
+    if (existing.area_id !== null) {
+      await dbRun(`
+        UPDATE area_parkir
+        SET terisi = CASE WHEN terisi > 0 THEN terisi - 1 ELSE 0 END
+        WHERE id = ?
+      `, [existing.area_id]);
+    }
+
+    return findTransaksiById(id);
+  });
+
+const deleteTransaksi = (id) =>
+  withTransaction(async () => {
+    const existing = await findTransaksiById(id);
+    if (!existing) throw new AppError(404, 'Transaksi parkir tidak ditemukan.');
+    if (existing.status === 'aktif') {
+      throw new AppError(409, 'Transaksi masih aktif. Proses kendaraan keluar sebelum menghapus.');
+    }
+
+    const { changes } = await dbRun(
+      "DELETE FROM transaksi_parkir WHERE id = ? AND status = 'selesai'",
+      [id]
     );
-  }
-
-  return await findTransaksiById(id);
-};
-
-// 5. Hapus Transaksi Parkir
-const deleteTransaksi = async (id) => {
-  const { changes } = await dbRun('DELETE FROM transaksi_parkir WHERE id = ?', [id]);
-  return changes > 0;
-};
-
-/* =========================================================
- *  AREA PARKIR
- * ========================================================= */
-
-// 6. Ambil semua data area / slot parkir
-const findAllArea = async () => {
-  return await dbAll('SELECT * FROM area_parkir ORDER BY id ASC');
-};
+    if (!changes) throw new AppError(409, 'Transaksi tidak dapat dihapus.');
+    return true;
+  });
 
 module.exports = {
   findAllTransaksi,
