@@ -10,7 +10,7 @@ const initSQL = fs.readFileSync(
   path.join(__dirname, '../sql_scripts/init.sql'),
   'utf8'
 );
-
+//tes
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Gagal terhubung ke SQLite:', err.message);
