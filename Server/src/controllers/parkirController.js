@@ -1,112 +1,117 @@
 const parkirModel = require('../models/parkirModel');
+const AppError = require('../middlewares_helpers/appError');
 
-/* =========================================================
- *  Helper: Standard Response (Menggunakan bawaan template)
- * ========================================================= */
 const success = (res, code, message, data = null) =>
   res.status(code).json({ success: true, message, data });
 
-const fail = (res, code, message, error = null) =>
+const fail = (res, code, message, error = message) =>
   res.status(code).json({ success: false, message, error });
 
-/* =========================================================
- *  1. GET /api/parkir/transaksi — Semua Riwayat Parkir
- * ========================================================= */
-const getAllTransaksi = async (req, res) => {
+const handleError = (res, error, context) => {
+  if (error instanceof AppError) {
+    return fail(res, error.statusCode, error.message);
+  }
+  console.error(`[${context}]`, error);
+  return fail(res, 500, 'Terjadi kesalahan pada server.', 'Server Error');
+};
+
+const parseId = (raw, field = 'id') => {
+  const text = String(raw ?? '');
+  const value = Number(text);
+  if (!/^\d+$/.test(text) || !Number.isSafeInteger(value) || value <= 0) {
+    throw new AppError(400, `${field} harus berupa bilangan bulat positif.`);
+  }
+  return value;
+};
+
+const getAllTransaksi = async (_req, res) => {
   try {
     const transaksi = await parkirModel.findAllTransaksi();
-    success(res, 200, 'Berhasil mengambil semua data transaksi parkir', transaksi);
+    return success(res, 200, 'Berhasil mengambil semua transaksi parkir.', transaksi);
   } catch (error) {
-    console.error('[getAllTransaksi]', error);
-    fail(res, 500, 'Server Error', error.message);
+    return handleError(res, error, 'getAllTransaksi');
   }
 };
 
-/* =========================================================
- *  2. GET /api/parkir/transaksi/:id — Detail Parkir by ID
- * ========================================================= */
 const getTransaksiById = async (req, res) => {
   try {
-    const transaksi = await parkirModel.findTransaksiById(req.params.id);
-    if (!transaksi) return fail(res, 404, 'Data transaksi parkir tidak ditemukan');
-    success(res, 200, 'Berhasil mengambil data transaksi', transaksi);
+    const id = parseId(req.params.id);
+    const transaksi = await parkirModel.findTransaksiById(id);
+    if (!transaksi) throw new AppError(404, 'Transaksi parkir tidak ditemukan.');
+    return success(res, 200, 'Berhasil mengambil detail transaksi parkir.', transaksi);
   } catch (error) {
-    console.error('[getTransaksiById]', error);
-    fail(res, 500, 'Server Error', error.message);
+    return handleError(res, error, 'getTransaksiById');
   }
 };
 
-/* =========================================================
- *  3. POST /api/parkir/masuk — Kendaraan Masuk (Check-in)
- * ========================================================= */
 const kendaraanMasuk = async (req, res) => {
   try {
-    const { plat_nomor, jenis_kendaraan, area_id } = req.body;
+    const { plat_nomor, jenis_kendaraan, area_id } = req.body ?? {};
 
-    // Validasi input
-    if (!plat_nomor || plat_nomor.trim() === '') {
-      return fail(res, 400, 'Validasi gagal', 'plat_nomor wajib diisi');
+    if (typeof plat_nomor !== 'string' || !plat_nomor.trim()) {
+      throw new AppError(400, 'Plat nomor wajib diisi.');
     }
-    if (!jenis_kendaraan || !['mobil', 'motor'].includes(jenis_kendaraan.toLowerCase())) {
-      return fail(res, 400, 'Validasi gagal', 'jenis_kendaraan wajib berupa "mobil" atau "motor"');
+    const plat = plat_nomor.trim().replace(/\s+/g, ' ').toUpperCase();
+    if (plat.length < 3 || plat.length > 20 || !/^[A-Z0-9 -]+$/.test(plat) ||
+      !/[A-Z]/.test(plat) || !/[0-9]/.test(plat)) {
+      throw new AppError(400, 'Plat nomor harus 3–20 karakter dan mengandung huruf serta angka.');
     }
+
+    if (typeof jenis_kendaraan !== 'string' ||
+      !['mobil', 'motor'].includes(jenis_kendaraan.trim().toLowerCase())) {
+      throw new AppError(400, 'Jenis kendaraan harus "mobil" atau "motor".');
+    }
+
+    // Kompatibel dengan kode lama: bila area_id tidak dikirim, gunakan area 1.
+    const areaId = area_id === undefined || area_id === null || area_id === ''
+      ? 1
+      : parseId(area_id, 'area_id');
 
     const created = await parkirModel.createKendaraanMasuk({
-      plat_nomor: plat_nomor.toUpperCase(),
-      jenis_kendaraan: jenis_kendaraan.toLowerCase(),
-      area_id: area_id || 1,
+      plat_nomor: plat,
+      jenis_kendaraan: jenis_kendaraan.trim().toLowerCase(),
+      area_id: areaId,
     });
-
-    success(res, 201, 'Kendaraan berhasil masuk (Check-in berhasil)', created);
+    return success(res, 201, 'Kendaraan berhasil masuk.', created);
   } catch (error) {
-    console.error('[kendaraanMasuk]', error);
-    fail(res, 500, 'Server Error', error.message);
+    return handleError(res, error, 'kendaraanMasuk');
   }
 };
 
-/* =========================================================
- *  4. PUT/PATCH /api/parkir/keluar/:id — Kendaraan Keluar (Check-out)
- * ========================================================= */
 const kendaraanKeluar = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { biaya } = req.body;
+    const id = parseId(req.params.id);
+    const rawBiaya = req.body?.biaya;
+    // Tarif lama tetap dipertahankan: Rp5.000 jika tidak ada biaya yang dikirim.
+    // Angka 0 diterima untuk transaksi gratis (tidak diganti dengan 5000).
+    const biaya = rawBiaya === undefined ? 5000 : rawBiaya;
+    if (typeof biaya !== 'number' || !Number.isSafeInteger(biaya) || biaya < 0) {
+      throw new AppError(400, 'Biaya harus berupa angka bulat 0 atau lebih.');
+    }
 
-    const updated = await parkirModel.processKendaraanKeluar(id, biaya || 5000);
-    if (!updated) return fail(res, 404, 'Data transaksi parkir tidak ditemukan atau sudah selesai');
-
-    success(res, 200, 'Kendaraan berhasil keluar (Check-out selesai)', updated);
+    const updated = await parkirModel.processKendaraanKeluar(id, biaya);
+    return success(res, 200, 'Kendaraan berhasil keluar.', updated);
   } catch (error) {
-    console.error('[kendaraanKeluar]', error);
-    fail(res, 500, 'Server Error', error.message);
+    return handleError(res, error, 'kendaraanKeluar');
   }
 };
 
-/* =========================================================
- *  5. DELETE /api/parkir/transaksi/:id — Hapus Data Parkir
- * ========================================================= */
 const deleteTransaksi = async (req, res) => {
   try {
-    const deleted = await parkirModel.deleteTransaksi(req.params.id);
-    if (!deleted) return fail(res, 404, 'Data transaksi parkir tidak ditemukan');
-
-    success(res, 200, 'Data transaksi parkir berhasil dihapus');
+    const id = parseId(req.params.id);
+    await parkirModel.deleteTransaksi(id);
+    return success(res, 200, 'Transaksi parkir berhasil dihapus.');
   } catch (error) {
-    console.error('[deleteTransaksi]', error);
-    fail(res, 500, 'Server Error', error.message);
+    return handleError(res, error, 'deleteTransaksi');
   }
 };
 
-/* =========================================================
- *  6. GET /api/parkir/area — Semua Slot/Area Parkir
- * ========================================================= */
-const getAllArea = async (req, res) => {
+const getAllArea = async (_req, res) => {
   try {
     const area = await parkirModel.findAllArea();
-    success(res, 200, 'Berhasil mengambil daftar area parkir', area);
+    return success(res, 200, 'Berhasil mengambil daftar area parkir.', area);
   } catch (error) {
-    console.error('[getAllArea]', error);
-    fail(res, 500, 'Server Error', error.message);
+    return handleError(res, error, 'getAllArea');
   }
 };
 
